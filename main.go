@@ -44,7 +44,7 @@ func handleSignals() context.Context {
 
 func main() {
 	ctx := handleSignals()
-	messages := make(chan string, messageBufferSize)
+	messages := make(chan *protocol.LogEntry, messageBufferSize)
 	done := messageWriter(messages)
 
 	listener, err := net.Listen("tcp", ":6839")
@@ -65,7 +65,7 @@ func main() {
 	<-done
 }
 
-func messageWriter(messages <-chan string) <-chan struct{} {
+func messageWriter(messages <-chan *protocol.LogEntry) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		for {
@@ -84,7 +84,7 @@ func messageWriter(messages <-chan string) <-chan struct{} {
 
 var ErrContextStop = errors.New("stopping server gracefully")
 
-func listen(ctx context.Context, wg *sync.WaitGroup, listener net.Listener, messages chan string) (exitErr error) {
+func listen(ctx context.Context, wg *sync.WaitGroup, listener net.Listener, messages chan<- *protocol.LogEntry) (exitErr error) {
 	defer wg.Done()
 	defer func() {
 		if r := recover(); r != nil {
@@ -108,14 +108,12 @@ func listen(ctx context.Context, wg *sync.WaitGroup, listener net.Listener, mess
 				log.Printf("Failed to accept connection: %v\n", err)
 			}
 		}
-		addr := conn.RemoteAddr()
-		log.Printf("Received connection from %s\n", addr.String())
 		wg.Add(1)
 		go handleLogProducer(ctx, wg, conn, messages)
 	}
 }
 
-func handleLogProducer(ctx context.Context, wg *sync.WaitGroup, conn net.Conn, buffer chan <-string) {
+func handleLogProducer(ctx context.Context, wg *sync.WaitGroup, conn net.Conn, buffer chan<- *protocol.LogEntry) {
 	defer wg.Done()
 	// Client should send a version specifier first.
 	scanner := bufio.NewScanner(conn)
@@ -131,11 +129,10 @@ func handleLogProducer(ctx context.Context, wg *sync.WaitGroup, conn net.Conn, b
 			return
 		}
 	}
-	if err := scanner.Err(); err != nil  {
+	if err := scanner.Err(); err != nil {
 		log.Printf("Unable to read from stream: %v\n", err)
 		return
 	}
-	log.Println("Received valid version value from client")
 
 	go func() {
 		<-ctx.Done()
@@ -144,11 +141,13 @@ func handleLogProducer(ctx context.Context, wg *sync.WaitGroup, conn net.Conn, b
 		}
 	}()
 	for scanner.Scan() {
-		buffer <- scanner.Text()
+		entry := new(protocol.LogEntry)
+		data := scanner.Bytes()
+		entry.Unmarshal(data)
+		buffer <- entry
 	}
 	if err := scanner.Err(); err != nil {
 		log.Printf("Error reading from stream: %v\n", err)
 		return
 	}
-	log.Printf("Closed connection from %s\n", conn.RemoteAddr().String())
 }

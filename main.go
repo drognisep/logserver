@@ -1,9 +1,7 @@
 package main
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -12,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"time"
 )
 
 const (
@@ -47,7 +46,7 @@ func main() {
 	messages := make(chan *protocol.LogEntry, messageBufferSize)
 	done := messageWriter(messages)
 
-	listener, err := net.Listen("tcp", ":6839")
+	listener, err := net.ListenTCP("tcp", &net.TCPAddr{Port: 6839})
 	if err != nil {
 		log.Fatalf("Failed to start network listener: %v\n", err)
 	}
@@ -65,26 +64,9 @@ func main() {
 	<-done
 }
 
-func messageWriter(messages <-chan *protocol.LogEntry) <-chan struct{} {
-	done := make(chan struct{})
-	go func() {
-		for {
-			select {
-			case msg, more := <-messages:
-				if !more {
-					close(done)
-					return
-				}
-				log.Println(msg)
-			}
-		}
-	}()
-	return done
-}
-
 var ErrContextStop = errors.New("stopping server gracefully")
 
-func listen(ctx context.Context, wg *sync.WaitGroup, listener net.Listener, messages chan<- *protocol.LogEntry) (exitErr error) {
+func listen(ctx context.Context, wg *sync.WaitGroup, listener *net.TCPListener, messages chan<- *protocol.LogEntry) (exitErr error) {
 	defer wg.Done()
 	defer func() {
 		if r := recover(); r != nil {
@@ -99,7 +81,7 @@ func listen(ctx context.Context, wg *sync.WaitGroup, listener net.Listener, mess
 	}()
 	log.Println("Listening for log messages")
 	for {
-		conn, err := listener.Accept()
+		conn, err := listener.AcceptTCP()
 		if err != nil {
 			select {
 			case <-ctx.Done():
@@ -108,46 +90,12 @@ func listen(ctx context.Context, wg *sync.WaitGroup, listener net.Listener, mess
 				log.Printf("Failed to accept connection: %v\n", err)
 			}
 		}
+		if err := conn.SetKeepAlive(true); err != nil {
+			log.Printf("Failed to enable keepalive for client %s: %v\n", conn.RemoteAddr().String(), err)
+		} else if err := conn.SetKeepAlivePeriod(5 * time.Second); err != nil {
+			log.Printf("SetKeepAlivePeriod: %v\n", err)
+		}
 		wg.Add(1)
 		go handleLogProducer(ctx, wg, conn, messages)
-	}
-}
-
-func handleLogProducer(ctx context.Context, wg *sync.WaitGroup, conn net.Conn, buffer chan<- *protocol.LogEntry) {
-	defer wg.Done()
-	// Client should send a version specifier first.
-	scanner := bufio.NewScanner(conn)
-	if scanner.Scan() {
-		data := scanner.Bytes()
-		version := new(protocol.VersionSpecifier)
-		if err := json.Unmarshal(data, version); err != nil {
-			log.Printf("Unable to read protocol version: %v\n", err)
-			return
-		}
-		if err := protocol.ValidateVersion(*version); err != nil {
-			log.Printf("Invalid version specifier: %v\n", err)
-			return
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		log.Printf("Unable to read from stream: %v\n", err)
-		return
-	}
-
-	go func() {
-		<-ctx.Done()
-		if err := conn.Close(); err != nil {
-			log.Printf("Failed to close client connection: %v\n", err)
-		}
-	}()
-	for scanner.Scan() {
-		entry := new(protocol.LogEntry)
-		data := scanner.Bytes()
-		entry.Unmarshal(data)
-		buffer <- entry
-	}
-	if err := scanner.Err(); err != nil {
-		log.Printf("Error reading from stream: %v\n", err)
-		return
 	}
 }
